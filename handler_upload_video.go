@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -46,8 +51,6 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusUnauthorized, "User must be video owner", err)
 		return
 	}
-
-	fmt.Println("uploading video", videoID, "by user", userID)
 
 	const maxMemory = 1 << 30 // 1 GB
 	r.Body = http.MaxBytesReader(w, r.Body, maxMemory)
@@ -87,9 +90,17 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspRatio, err := getVideoAspectRatio(f.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get video aspect ratio", err)
+		return
+	}
+
 	key := make([]byte, 32)
 	rand.Read(key)
-	objKey := base64.RawURLEncoding.EncodeToString(key) + "." + strings.Split(mType, "/")[1]
+	objKey := fmt.Sprintf("%s/%s.%s", aspRatio, base64.RawURLEncoding.EncodeToString(key), strings.Split(mType, "/")[1])
+
+	fmt.Println("uploading video", url.PathEscape(objKey), "by user", userID)
 
 	params := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
@@ -99,14 +110,58 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	if _, err = cfg.s3Client.PutObject(context.Background(), &params); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Coudln't put object into S3", err)
+		respondWithError(w, http.StatusInternalServerError, "Coudln't add object into S3", err)
 		return
 	}
 
-	url := fmt.Sprintf("http://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, objKey)
-	video.VideoURL = &url
+	s3URL := fmt.Sprintf("http://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, url.PathEscape(objKey))
+	video.VideoURL = &s3URL
 	if err = cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video in db", err)
 		return
 	}
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type VideoInfo struct {
+		Streams []struct {
+			Width  int `json:"width,omitempty"`
+			Height int `json:"height,omitempty"`
+		} `json:"streams"`
+	}
+
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		log.Printf("File does not exist: %s", filePath)
+		return "", err
+	}
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("Couldn't run ffprobe: %v, stderr: %s", err, stderr.String())
+		return "", err
+	}
+
+	data := VideoInfo{}
+	if err := json.Unmarshal(stdout.Bytes(), &data); err != nil {
+		log.Printf("Couldn't unmarshal stdout: %v", err)
+		return "", err
+	}
+
+	if len(data.Streams) == 0 {
+		log.Printf("Couldn't get video info")
+		return "", nil
+	}
+
+	aspRatio := "other"
+	result := float64(data.Streams[0].Width) / float64(data.Streams[0].Height)
+	if result >= 1.76 && result <= 1.78 {
+		aspRatio = "landscape"
+	} else if result >= 0.55 && result <= 0.57 {
+		aspRatio = "portrait"
+	}
+
+	return aspRatio, nil
 }
