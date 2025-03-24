@@ -11,7 +11,6 @@ import (
 	"log"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -90,7 +89,20 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	aspRatio, err := getVideoAspectRatio(f.Name())
+	fsVideo, err := processVideoForFastStart(f.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for fast start", err)
+		return
+	}
+
+	fsf, err := os.Open(fsVideo)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open fast start video for reading", err)
+		return
+	}
+	defer fsf.Close()
+
+	aspRatio, err := getVideoAspectRatio(fsVideo)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't get video aspect ratio", err)
 		return
@@ -100,21 +112,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	rand.Read(key)
 	objKey := fmt.Sprintf("%s/%s.%s", aspRatio, base64.RawURLEncoding.EncodeToString(key), strings.Split(mType, "/")[1])
 
-	fmt.Println("uploading video", url.PathEscape(objKey), "by user", userID)
+	fmt.Println("uploading video", objKey, "by user", userID)
 
 	params := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &objKey,
-		Body:        f,
+		Body:        fsf,
 		ContentType: &mType,
 	}
 
 	if _, err = cfg.s3Client.PutObject(context.Background(), &params); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Coudln't add object into S3", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't add object into S3", err)
 		return
 	}
 
-	s3URL := fmt.Sprintf("http://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, url.PathEscape(objKey))
+	s3URL := fmt.Sprintf("http://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, objKey)
 	video.VideoURL = &s3URL
 	if err = cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video in db", err)
@@ -136,6 +148,7 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 
 	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -164,4 +177,18 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 
 	return aspRatio, nil
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	path := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", path)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("Couldn't run ffmpeg: %v, stderr: %s", err, stderr.String())
+		return "", err
+	}
+
+	return path, nil
 }
