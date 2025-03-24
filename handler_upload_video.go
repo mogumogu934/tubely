@@ -126,12 +126,34 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s3URL := fmt.Sprintf("http://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, objKey)
+	s3URL := fmt.Sprintf("%s,%s", cfg.s3Bucket, objKey)
 	video.VideoURL = &s3URL
 	if err = cfg.db.UpdateVideo(video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Couldn't update video in db", err)
 		return
 	}
+
+	signedVideo, err := cfg.dbVideoToSignedVideo(video)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't sign video", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, signedVideo)
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	path := filePath + ".processing"
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", path)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		log.Printf("Couldn't run ffmpeg: %v, stderr: %s", err, stderr.String())
+		return "", err
+	}
+
+	return path, nil
 }
 
 func getVideoAspectRatio(filePath string) (string, error) {
@@ -177,18 +199,4 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 
 	return aspRatio, nil
-}
-
-func processVideoForFastStart(filePath string) (string, error) {
-	path := filePath + ".processing"
-	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", path)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		log.Printf("Couldn't run ffmpeg: %v, stderr: %s", err, stderr.String())
-		return "", err
-	}
-
-	return path, nil
 }

@@ -1,0 +1,8 @@
+### Test login
+POST http://localhost:8091/api/login
+Content-Type: application/json
+
+{
+    "email": "admin@tubely.com",
+    "password": "password"
+}
